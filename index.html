@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>開啟視訊</title>
+  <style>
+    body {
+      text-align: center;
+      background-color: #f0f0f0;
+      font-family: sans-serif;
+      margin: 0;
+    }
+    h1 { margin-top: 16px; }
+
+    .stage {
+      display: inline-block;
+      position: relative;
+      margin-top: 50px; /* 延續原本 video 的上邊距 */
+    }
+
+    video {
+      border: 2px solid #333;
+      /* 自適應：寬度不超過螢幕，維持 4:3，上限不超過視窗高 */
+      width: min(96vw, calc(96vh * 4 / 3));
+      max-height: 96vh;
+      height: auto;
+      transform: scaleX(-1); /* 鏡像呈現 */
+      display: block;
+    }
+
+    /* 疊加畫布跟著 video 尺寸走，不再鏡像（關鍵修正） */
+    #overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      /* 移除原本的 transform: scaleX(-1); */
+    }
+  </style>
+</head>
+<body>
+  <h1>視訊鏡頭畫面</h1>
+  <div class="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <!-- MediaPipe Hands 依賴 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+  <script>
+    (function () {
+      const videoEl = document.getElementById("video");
+      const canvas = document.getElementById("overlay");
+      const ctx = canvas.getContext("2d");
+      let currentStream = null;
+      let camera = null;
+      let hands = null;
+
+      // 追蹤框狀態（平滑處理）
+      let boxSmooth = null; // {x,y,w,h}
+      let lastLeftSeen = 0;
+      const SMOOTH = 0.25;      // 指數平滑係數
+      const HIDE_AFTER = 300;   // 毫秒，超時就隱藏
+
+      function stopStream() {
+        if (currentStream) {
+          currentStream.getTracks().forEach(t => t.stop());
+          currentStream = null;
+        }
+      }
+
+      async function getStream(constraints) {
+        stopStream();
+        return await navigator.mediaDevices.getUserMedia(constraints);
+      }
+
+      function explainError(err) {
+        const map = {
+          NotAllowedError: "使用者未授權或已封鎖攝影機權限。",
+          NotFoundError: "找不到可用的攝影機裝置。",
+          NotReadableError: "攝影機被其他程式占用或系統拒絕存取。",
+          OverconstrainedError: "指定的相機條件不被支援（可能沒有前鏡頭）。",
+          SecurityError: "必須在 HTTPS 或 localhost 下存取。",
+          AbortError: "請重新嘗試或檢查裝置連線。",
+          TypeError: "未提供有效的媒體條件。"
+        };
+        return map[err && err.name] || (err && err.message) || "未知錯誤";
+      }
+
+      // 讓 canvas 的實體像素與 CSS 像素一致，避免模糊
+      function resizeCanvasToVideo() {
+        const dpr = window.devicePixelRatio || 1;
+        const w = videoEl.clientWidth;
+        const h = videoEl.clientHeight;
+
+        if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+          canvas.width = Math.round(w * dpr);
+          canvas.height = Math.round(h * dpr);
+          canvas.style.width = w + "px";
+          canvas.style.height = h + "px";
+
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.scale(dpr, dpr); // 以 CSS px 作畫
+        }
+      }
+
+      async function startCamera() {
+        try {
+          currentStream = await getStream({ video: { facingMode: { exact: "user" } }, audio: false });
+        } catch (_) {
+          try {
+            currentStream = await getStream({ video: { facingMode: "user" }, audio: false });
+          } catch (_) {
+            currentStream = await getStream({ video: true, audio: false });
+          }
+        }
+        videoEl.srcObject = currentStream;
+        try { await videoEl.play(); } catch (_) {}
+
+        videoEl.addEventListener('loadedmetadata', resizeCanvasToVideo, { once: true });
+        resizeCanvasToVideo();
+      }
+
+      function pickLeftHand(results) {
+        const { multiHandLandmarks, multiHandedness } = results;
+        if (!multiHandLandmarks || !multiHandedness) return null;
+
+        for (let i = 0; i < multiHandLandmarks.length; i++) {
+          const handed = multiHandedness[i] && multiHandedness[i].label; // 'Left' or 'Right'
+          if (handed === 'Left') {
+            return multiHandLandmarks[i];
+          }
+        }
+        return null;
+      }
+
+      function landmarksToBox(landmarks, w, h) {
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of landmarks) {
+          const x = p.x * w;
+          const y = p.y * h;
+          if (x < minX) minX = x;
+          if (y < minY) minY = y;
+          if (x > maxX) maxX = x;
+          if (y > maxY) maxY = y;
+        }
+        const pad = Math.max(8, Math.min(w, h) * 0.04);
+        minX -= pad; minY -= pad; maxX += pad; maxY += pad;
+        const box = { x: minX, y: minY, w: (maxX - minX), h: (maxY - minY) };
+        box.x = Math.max(0, Math.min(box.x, w - box.w));
+        box.y = Math.max(0, Math.min(box.y, h - box.h));
+        return box;
+      }
+
+      function smoothBox(target, prev, alpha) {
+        if (!prev) return target;
+        return {
+          x: prev.x + (target.x - prev.x) * alpha,
+          y: prev.y + (target.y - prev.y) * alpha,
+          w: prev.w + (target.w - prev.w) * alpha,
+          h: prev.h + (target.h - prev.h) * alpha,
+        };
+      }
+
+      function drawBox(box) {
+        const { x, y, w, h } = box;
+        ctx.save();
+        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = "rgba(0, 153, 255, 0.95)";
+        ctx.fillStyle = "rgba(0, 153, 255, 0.08)";
+        ctx.beginPath();
+        ctx.rect(x, y, w, h);
+        ctx.fill();
+        ctx.stroke();
+
+        const L = Math.max(12, Math.min(w, h) * 0.15);
+        ctx.lineWidth = 5;
+        ctx.strokeStyle = "rgba(0, 153, 255, 1)";
+        // 四角角標
+        ctx.beginPath(); ctx.moveTo(x, y + L); ctx.lineTo(x, y); ctx.lineTo(x + L, y); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x + w - L, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + L); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x, y + h - L); ctx.lineTo(x, y + h); ctx.lineTo(x + L, y + h); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(x + w - L, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - L); ctx.stroke();
+
+        // 標籤
+        ctx.font = "bold 16px sans-serif";
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(x, Math.max(0, y - 26), 52, 24);
+        ctx.fillStyle = "#fff";
+        ctx.fillText("左手", x + 10, Math.max(16, y - 8));
+        ctx.restore();
+      }
+
+      function clearCanvasIfStale() {
+        if (Date.now() - lastLeftSeen > HIDE_AFTER) {
+          ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+          boxSmooth = null;
+        }
+      }
+
+      function setupHands() {
+        hands = new Hands({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+        hands.setOptions({
+          selfieMode: true,            // 與鏡像顯示一致（關鍵保留）
+          maxNumHands: 2,
+          modelComplexity: 1,
+          minDetectionConfidence: 0.6,
+          minTrackingConfidence: 0.5
+        });
+
+        hands.onResults((results) => {
+          resizeCanvasToVideo(); // 保持畫布同步尺寸
+
+          const left = pickLeftHand(results);
+          if (!left) {
+            clearCanvasIfStale();
+            return;
+          }
+
+          lastLeftSeen = Date.now();
+          const w = canvas.clientWidth;
+          const h = canvas.clientHeight;
+          const boxNow = landmarksToBox(left, w, h);
+          boxSmooth = smoothBox(boxNow, boxSmooth, SMOOTH);
+          drawBox(boxSmooth);
+        });
+      }
+
+      async function startPipeline() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          alert("您的瀏覽器不支援攝影機存取（WebRTC）。請使用最新版 Chrome、Edge、Firefox 或 Safari。");
+          return;
+        }
+        if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+          console.warn("建議以 HTTPS 或 localhost 提供頁面，以確保可存取攝影機。");
+        }
+
+        await startCamera();
+
+        if (!(window.Hands && window.Camera)) {
+          alert("無法載入手部偵測模組，請檢查網路或稍後再試。");
+          return;
+        }
+
+        setupHands();
+
+        camera = new Camera(videoEl, {
+          onFrame: async () => {
+            try {
+              await hands.send({ image: videoEl });
+            } catch (e) {}
+            clearCanvasIfStale();
+          },
+          width: 640,
+          height: 480
+        });
+
+        camera.start();
+      }
+
+      window.addEventListener('load', startPipeline);
+      window.addEventListener('resize', resizeCanvasToVideo);
+
+      window.addEventListener('beforeunload', () => {
+        try { if (camera && camera.stop) camera.stop(); } catch {}
+        try { if (hands && hands.close) hands.close(); } catch {}
+        stopStream();
+      });
+    })();
+  </script>
+</body>
+</html>
